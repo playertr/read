@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Test artifacts
+test-results/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# PDFs (copyrighted academic papers)
+*.pdf
+papers/
+
+# Editor / IDE
+.vscode/
+
+# Session and prompt files
+CLAUDE.md
+.github/prompts/
+
+# Scratch / dev notes
+scratch/
+
+# Playwright browsers
+/playwright-report/
+
+# Environment
+.env
+.env.*
