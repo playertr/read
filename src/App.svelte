@@ -222,7 +222,7 @@
       return;
     }
 
-    const allSpans = Array.from(textLayer.querySelectorAll('span'));
+    const allSpans = Array.from(textLayer.querySelectorAll('span:not(.markedContent)'));
     // Highlight the full range of spans (min to max index) so space
     // spans between words are also highlighted — no striped gaps.
     const minIdx = Math.min(...sentence.itemIndices);

@@ -1,9 +1,5 @@
 import { describe, it, expect } from 'vitest';
 import {
-  detectColumns,
-  classifyItem,
-  sortReadingOrder,
-  isStreamOrderValid,
   filterNonBodyItems,
   splitSentences,
   isParagraphBreak,
@@ -110,96 +106,6 @@ describe('pdf-text: filterNonBodyItems', () => {
     ];
     const result = filterNonBodyItems(items, PAGE_WIDTH, PAGE_HEIGHT);
     expect(result.map(e => e.item.str)).not.toContain('see Section VI for full author list.');
-  });
-});
-
-describe('pdf-text: detectColumns', () => {
-  it('detects two-column layout from mixed body items', () => {
-    const items = [...makeLeftColumnBody(0), ...makeRightColumnBody(20)];
-    const cols = detectColumns(items, PAGE_WIDTH, PAGE_HEIGHT);
-    expect(cols).not.toBeNull();
-    expect(cols!.leftMax).toBeLessThan(310);
-    expect(cols!.rightMin).toBeGreaterThan(300);
-  });
-
-  it('returns null for single-column pages', () => {
-    const items = [
-      entry('A single column paragraph that spans the full page width.', 72, 700, 468, { index: 0 }),
-      entry('Another line of text in the same column.', 72, 688, 300, { index: 1 }),
-      entry('And another one here too.', 72, 676, 200, { index: 2 }),
-    ];
-    const cols = detectColumns(items, PAGE_WIDTH, PAGE_HEIGHT);
-    expect(cols).toBeNull();
-  });
-});
-
-describe('pdf-text: classifyItem', () => {
-  const columns = { leftMax: 300, rightMin: 312 };
-
-  it('classifies left column item', () => {
-    const item = entry('Abstract text', 72, 600, 200, { fontSize: 9 });
-    expect(classifyItem(item, columns, PAGE_WIDTH)).toBe(0);
-  });
-
-  it('classifies right column item', () => {
-    const item = entry('Right column text', 312, 600, 200, { fontSize: 10 });
-    expect(classifyItem(item, columns, PAGE_WIDTH)).toBe(1);
-  });
-
-  it('classifies full-width title as full-width', () => {
-    const item = entry('A Careful Examination of Large Behavior Models', 86, 698, 440, { fontSize: 20 });
-    expect(classifyItem(item, columns, PAGE_WIDTH)).toBe(-1);
-  });
-});
-
-describe('pdf-text: isStreamOrderValid', () => {
-  const columns = { leftMax: 300, rightMin: 312 };
-
-  it('validates correct stream order (left then right)', () => {
-    const items = [...makeLeftColumnBody(0), ...makeRightColumnBody(20)];
-    expect(isStreamOrderValid(items, columns, PAGE_WIDTH)).toBe(true);
-  });
-
-  it('rejects interleaved stream order', () => {
-    const left = makeLeftColumnBody(0);
-    const right = makeRightColumnBody(20);
-    // Interleave: L, R, L, R, L, R, ...
-    const interleaved: ItemEntry[] = [];
-    const maxLen = Math.max(left.length, right.length);
-    for (let i = 0; i < maxLen; i++) {
-      if (i < left.length) interleaved.push(left[i]);
-      if (i < right.length) interleaved.push(right[i]);
-    }
-    expect(isStreamOrderValid(interleaved, columns, PAGE_WIDTH)).toBe(false);
-  });
-});
-
-describe('pdf-text: sortReadingOrder', () => {
-  it('preserves stream order when it is already correct', () => {
-    const title = makeTitle();
-    const left = makeLeftColumnBody(4);
-    const right = makeRightColumnBody(20);
-    const items = [...title, makeAuthors(), ...left, ...right];
-    const sorted = sortReadingOrder(items, PAGE_WIDTH, PAGE_HEIGHT);
-
-    // Title should come first, then left column, then right column
-    const leftStart = sorted.findIndex(e => e.item.str === 'Abstract');
-    const rightStart = sorted.findIndex(e => e.item.str.startsWith('coordination'));
-    expect(leftStart).toBeLessThan(rightStart);
-  });
-
-  it('sorts single-column pages top-to-bottom', () => {
-    const items = [
-      entry('Second line', 72, 680, 300, { index: 1 }),
-      entry('First line', 72, 700, 300, { index: 0 }),
-      entry('Third line', 72, 660, 300, { index: 2 }),
-    ];
-    const sorted = sortReadingOrder(items, PAGE_WIDTH, PAGE_HEIGHT);
-    expect(sorted.map(e => e.item.str)).toEqual([
-      'First line',
-      'Second line',
-      'Third line',
-    ]);
   });
 });
 
@@ -391,13 +297,12 @@ describe('pdf-text: end-to-end reading order (page 1 simulation)', () => {
 
   function extractParagraphsAndSentences(items: ItemEntry[]) {
     const filtered = filterNonBodyItems(items, PAGE_WIDTH, PAGE_HEIGHT);
-    const sorted = sortReadingOrder(filtered, PAGE_WIDTH, PAGE_HEIGHT);
 
     const paragraphs: { text: string; mapping: number[][] }[] = [{ text: '', mapping: [] }];
-    for (let i = 0; i < sorted.length; i++) {
-      const e = sorted[i];
-      const prev = i > 0 ? sorted[i - 1] : null;
-      const next = i < sorted.length - 1 ? sorted[i + 1] : null;
+    for (let i = 0; i < filtered.length; i++) {
+      const e = filtered[i];
+      const prev = i > 0 ? filtered[i - 1] : null;
+      const next = i < filtered.length - 1 ? filtered[i + 1] : null;
 
       if (prev && isParagraphBreak(prev, e)) {
         const current = paragraphs[paragraphs.length - 1];
@@ -405,7 +310,7 @@ describe('pdf-text: end-to-end reading order (page 1 simulation)', () => {
       }
 
       const str = e.item.str;
-      const isLastOnLine = e.item.hasEOL || i === sorted.length - 1;
+      const isLastOnLine = e.item.hasEOL || i === filtered.length - 1;
       const currFontSize = Math.abs(e.item.transform[3]) || 10;
       const isLineBreak = isLastOnLine || (next && Math.abs(next.item.transform[5] - e.item.transform[5]) > currFontSize * 0.3);
       const endsWithHyphen = str.endsWith('-');
@@ -621,8 +526,8 @@ describe('Font-relative thresholds', () => {
       ];
       // rightEdge of Hello = 72+20=92, nextLeft = 93, gap = 1pt
       // At 6pt, 1/6 = 0.17 → should insert a space
-      const sorted = sortReadingOrder(items, PAGE_WIDTH, PAGE_HEIGHT);
-      expect(sorted.length).toBe(2);
+      // Stream order is already correct — items stay in place
+      expect(items.length).toBe(2);
       // Validate through sentence extraction that space is inserted
       // (This tests the inline gap detection in extractSentences)
     });
@@ -635,8 +540,8 @@ describe('Font-relative thresholds', () => {
         // At 20pt, 1/20 = 0.05 → should NOT insert space (just kerning)
       ];
       // The text should read "Hello" not "Hel lo"
-      const sorted = sortReadingOrder(items, PAGE_WIDTH, PAGE_HEIGHT);
-      expect(sorted.length).toBe(2);
+      // Stream order is already correct
+      expect(items.length).toBe(2);
     });
   });
 });

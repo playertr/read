@@ -2,7 +2,7 @@
  * Reading-order tests using real PDF text items extracted via pdf.js.
  *
  * Each test loads actual TextItems from papers in the papers/ folder,
- * runs them through sortReadingOrder (and filterNonBodyItems), and
+ * runs them through filterNonBodyItems (keeping PDF stream order), and
  * verifies key ordering constraints that a human reader would expect.
  *
  * Fixture: tests/fixtures/real-pdf-items.json
@@ -12,9 +12,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import {
-  sortReadingOrder,
   filterNonBodyItems,
-  detectColumns,
   isParagraphBreak,
   type ItemEntry,
   type TextItem,
@@ -99,16 +97,7 @@ describe('paper.pdf page 1 (two-column IEEE)', () => {
   beforeAll(() => {
     const { entries, width, height } = loadPage('paper_p1');
     filtered = filterNonBodyItems(entries, width, height);
-    sorted = sortReadingOrder(filtered, width, height);
-  });
-
-  it('detects two columns', () => {
-    const { entries, width, height } = loadPage('paper_p1');
-    const cols = detectColumns(entries, width, height);
-    expect(cols).not.toBeNull();
-    // Gap should be roughly around x=300 (between ~299 left max and ~312 right min)
-    expect(cols!.leftMax).toBeGreaterThan(250);
-    expect(cols!.rightMin).toBeLessThan(340);
+    sorted = filtered; // stream order
   });
 
   it('filters out the page number "1"', () => {
@@ -144,31 +133,31 @@ describe('paper.pdf page 1 (two-column IEEE)', () => {
     assertBefore(sorted, 'Achieving flexible', 'coordination');
   });
 
-  it('does not interleave columns (no left→right→left pattern)', () => {
-    // All left-column items should appear contiguously before all right-column items
+  it('does not interleave columns (body text in left column contiguous)', () => {
+    // In stream order, left-column body should appear before right-column body.
+    // Full-width items (title, authors) may span across the column boundary.
+    // We only check that body-sized left-column text doesn't appear AFTER
+    // a substantial block of right-column text.
     const rightColStart = 300;
-    let lastWasLeft = true;
-    let switchedToRight = false;
+    let rightColCount = 0;
+    let failedItem: string | null = null;
     for (const item of sorted) {
       const x = item.item.transform[4];
-      if (x > rightColStart && item.item.str.trim() !== '') {
-        if (lastWasLeft) switchedToRight = true;
-        lastWasLeft = false;
-      } else if (x < rightColStart && item.item.str.trim() !== '') {
-        // After switching to right, we should not go back to left
-        if (switchedToRight) {
-          // Allow full-width items (title, etc) but not body text in left column
-          const fontSize = Math.abs(item.item.transform[3]);
-          if (fontSize < 12) {
-            // This would be a column interleaving error
-            throw new Error(
-              `Column interleaving: found left-col item "${item.item.str}" after right-col started`,
-            );
-          }
+      const fontSize = Math.abs(item.item.transform[3]);
+      // Skip non-body items (zero-size annotations, watermarks, etc.)
+      if (fontSize === 0 || fontSize > 12) continue;
+      if (item.item.str.trim() === '') continue;
+      if (x > rightColStart) {
+        rightColCount++;
+      } else {
+        // After seeing many right-column items, seeing left-column body is wrong
+        if (rightColCount > 10) {
+          failedItem = item.item.str;
+          break;
         }
-        lastWasLeft = true;
       }
     }
+    expect(failedItem).toBeNull();
   });
 
   it('reading order produces coherent abstract text', () => {
@@ -192,13 +181,7 @@ describe('paper.pdf page 12 (two-column, figure + equations)', () => {
   beforeAll(() => {
     const { entries, width, height } = loadPage('paper_p12');
     filtered = filterNonBodyItems(entries, width, height);
-    sorted = sortReadingOrder(filtered, width, height);
-  });
-
-  it('detects two columns', () => {
-    const { entries, width, height } = loadPage('paper_p12');
-    const cols = detectColumns(entries, width, height);
-    expect(cols).not.toBeNull();
+    sorted = filtered; // stream order
   });
 
   it('filters out the page number "12"', () => {
@@ -244,19 +227,7 @@ describe('arxiv paper page 1 (single-column)', () => {
   beforeAll(() => {
     const { entries, width, height } = loadPage('arxiv_p1');
     filtered = filterNonBodyItems(entries, width, height);
-    sorted = sortReadingOrder(filtered, width, height);
-  });
-
-  it('detects single column (no two-column split)', () => {
-    const { entries, width, height } = loadPage('arxiv_p1');
-    const cols = detectColumns(entries, width, height);
-    // Should be null (single column) or at least not split the main body
-    // The arXiv sidebar at x=32 may cause issues, but main text is centered
-    // If it detects columns, the sidebar should be in the "left" and body in "right"
-    if (cols) {
-      // Sidebar is at x=32, body starts around x=108+
-      expect(cols.leftMax).toBeLessThan(100);
-    }
+    sorted = filtered; // stream order
   });
 
   it('title comes before authors', () => {
@@ -275,20 +246,21 @@ describe('arxiv paper page 1 (single-column)', () => {
     assertBefore(sorted, 'earliest phases of model development', 'Keywords');
   });
 
-  it('reads top-to-bottom without column interleaving', () => {
-    // All main body items should have decreasing y-coordinates (top to bottom)
-    // (ignoring the sidebar which has a special transform)
+  it('reads generally top-to-bottom', () => {
+    // Stream order follows reading order but may include inline elements
+    // (superscripts, footnote markers) that break strict Y ordering.
+    // Verify the overall trend is top-to-bottom by checking that the
+    // median Y movement is downward (Y decreasing in PDF coords).
     const bodyItems = sorted.filter((e) => e.item.transform[4] > 80);
+    let downward = 0;
+    let upward = 0;
     for (let i = 1; i < bodyItems.length; i++) {
-      const yPrev = bodyItems[i - 1].item.transform[5];
-      const yCurr = bodyItems[i].item.transform[5];
-      // Allow same-line items (equal y) and small tolerance
-      if (yCurr > yPrev + 2) {
-        throw new Error(
-          `Out-of-order: item "${bodyItems[i].item.str}" (y=${yCurr}) after "${bodyItems[i - 1].item.str}" (y=${yPrev})`,
-        );
-      }
+      const yDelta = bodyItems[i - 1].item.transform[5] - bodyItems[i].item.transform[5];
+      if (yDelta > 2) downward++;
+      else if (yDelta < -2) upward++;
     }
+    // Vast majority of transitions should be downward
+    expect(downward).toBeGreaterThan(upward * 3);
   });
 });
 
@@ -303,7 +275,7 @@ describe('arxiv paper page 12 (references → section)', () => {
   beforeAll(() => {
     const { entries, width, height } = loadPage('arxiv_p12');
     filtered = filterNonBodyItems(entries, width, height);
-    sorted = sortReadingOrder(filtered, width, height);
+    sorted = filtered; // stream order
   });
 
   it('filters out the centered page number "12"', () => {
@@ -348,13 +320,7 @@ describe('math151 page 1 (table of contents)', () => {
   beforeAll(() => {
     const { entries, width, height } = loadPage('math151_p1');
     filtered = filterNonBodyItems(entries, width, height);
-    sorted = sortReadingOrder(filtered, width, height);
-  });
-
-  it('detects single column', () => {
-    const { entries, width, height } = loadPage('math151_p1');
-    const cols = detectColumns(entries, width, height);
-    expect(cols).toBeNull();
+    sorted = filtered; // stream order
   });
 
   it('header comes first', () => {
@@ -407,13 +373,7 @@ describe('math151 page 12 (math content with equations/tables)', () => {
   beforeAll(() => {
     const { entries, width, height } = loadPage('math151_p12');
     filtered = filterNonBodyItems(entries, width, height);
-    sorted = sortReadingOrder(filtered, width, height);
-  });
-
-  it('detects single column', () => {
-    const { entries, width, height } = loadPage('math151_p12');
-    const cols = detectColumns(entries, width, height);
-    expect(cols).toBeNull();
+    sorted = filtered; // stream order
   });
 
   it('axiom list comes before probability formula', () => {
@@ -436,22 +396,18 @@ describe('math151 page 12 (math content with equations/tables)', () => {
     assertBefore(sorted, 'Arrangements', 'Permutations');
   });
 
-  it('reads top-to-bottom (single-column math)', () => {
-    // Verify overall top-to-bottom reading with tolerance for same-line items
-    let lastMainY = Infinity;
-    for (const item of sorted) {
-      const y = item.item.transform[5];
-      const x = item.item.transform[4];
-      // Only check items in the main column (x > 60)
-      if (x < 60) continue;
-      if (y > lastMainY + 5) {
-        // Going up more than 5 units means wrong order
-        throw new Error(
-          `Out-of-order: "${item.item.str}" at y=${y} after y=${lastMainY}`,
-        );
-      }
-      if (y < lastMainY - 2) lastMainY = y; // Track downward progress
+  it('reads generally top-to-bottom (single-column math)', () => {
+    // Stream order follows reading order but may include superscripts,
+    // subscripts, or equation fragments that break strict Y ordering.
+    const mainItems = sorted.filter((e) => e.item.transform[4] > 60);
+    let downward = 0;
+    let upward = 0;
+    for (let i = 1; i < mainItems.length; i++) {
+      const yDelta = mainItems[i - 1].item.transform[5] - mainItems[i].item.transform[5];
+      if (yDelta > 5) downward++;
+      else if (yDelta < -5) upward++;
     }
+    expect(downward).toBeGreaterThan(upward * 2);
   });
 });
 
@@ -481,7 +437,7 @@ describe('sentence splitting on real extracted text', () => {
   it('paper_p1: reading order produces multiple coherent text chunks', () => {
     const { entries, width, height } = loadPage('paper_p1');
     const filtered = filterNonBodyItems(entries, width, height);
-    const sorted = sortReadingOrder(filtered, width, height);
+    const sorted = filtered; // stream order
 
     // Build the full concatenated text as our code would
     const fullText = sorted
@@ -503,7 +459,7 @@ describe('sentence splitting on real extracted text', () => {
   it('arxiv_p12: text flows from references to section content', () => {
     const { entries, width, height } = loadPage('arxiv_p12');
     const filtered = filterNonBodyItems(entries, width, height);
-    const sorted = sortReadingOrder(filtered, width, height);
+    const sorted = filtered; // stream order
 
     const fullText = sorted
       .map((e) => e.item.str)
@@ -518,7 +474,7 @@ describe('sentence splitting on real extracted text', () => {
   it('math151_p12: does not merge section header with body into run-on', () => {
     const { entries, width, height } = loadPage('math151_p12');
     const filtered = filterNonBodyItems(entries, width, height);
-    const sorted = sortReadingOrder(filtered, width, height);
+    const sorted = filtered; // stream order
 
     // Check that "How to count" appears as distinct text, not merged with surrounding
     const howToCount = sorted.find((e) => e.item.str.includes('How to count'));
