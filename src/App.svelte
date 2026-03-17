@@ -1,10 +1,9 @@
 <script lang="ts">
   import './app.css';
   import type { PluginRegistry } from '@embedpdf/svelte-pdf-viewer';
-  import type { PdfDocumentObject, PdfEngine, PdfPageObject, PdfTextRun } from '@embedpdf/models';
+  import type { PdfDocumentObject, PdfEngine, PdfPageObject, PdfTextRun, PdfAnnotationSubtype } from '@embedpdf/models';
   import PdfViewer from './lib/components/PdfViewer.svelte';
   import Controls from './lib/components/Controls.svelte';
-  import Highlight from './lib/components/Highlight.svelte';
   import { AudioPipeline } from './lib/audio-pipeline';
   import type { WorkerOutgoing } from './lib/tts-worker';
 
@@ -44,8 +43,9 @@
   let engine: PdfEngine | null = $state(null);
   let pdfDoc: PdfDocumentObject | null = $state(null);
 
-  // Highlight state: overlay rects in absolute document-container coords (CSS px)
-  let highlightRects: Array<{ x: number; y: number; width: number; height: number }> = $state([]);
+  // Highlight state: native annotation ID + page index for cleanup
+  let currentHighlightId: string | null = $state(null);
+  let currentHighlightPage: number = $state(-1);
 
   // --- Audio ---
   const audioPipeline = new AudioPipeline();
@@ -407,6 +407,7 @@
     const signal = playbackAbort.signal;
 
     await audioPipeline.init();
+    if (signal.aborted) return;
     audioPipeline.setSpeed(speed);
     isPlaying = true;
     isPaused = false;
@@ -456,89 +457,100 @@
 
 
   function clearHighlight() {
-    highlightRects = [];
+    if (currentHighlightId && currentHighlightPage >= 0 && registry) {
+      try {
+        const annoPlugin = registry.getPlugin('annotation') as any;
+        annoPlugin?.deleteAnnotation(currentHighlightPage, currentHighlightId);
+      } catch {}
+    }
+    currentHighlightId = null;
+    currentHighlightPage = -1;
   }
 
-  /**
-   * Compute the gap (in CSS px) between pages in the EmbedPDF document container.
-   * The container height = numPages * pageHeight * scale + (numPages-1) * gap.
-   */
-  function getPageGap(): number {
-    const container = document.querySelector('embedpdf-container');
-    const sr = container?.shadowRoot;
-    if (!sr) return 10;
-    const scrollEl = sr.querySelector('.bg-bg-app');
-    const docContainer = scrollEl?.firstElementChild?.firstElementChild as HTMLElement | null;
-    if (!docContainer || !pdfDoc) return 10;
-
-    const store = registry!.getStore();
-    const state = store.getState();
-    const activeDocId = state.core.activeDocumentId;
-    if (!activeDocId) return 10;
-    const docState = state.core.documents[activeDocId];
-    if (!docState) return 10;
-
-    const scale = docState.scale;
-    const totalRenderedHeight = pdfDoc.pages.reduce(
-      (sum, p) => sum + p.size.height * scale, 0
-    );
-    const containerHeight = docContainer.getBoundingClientRect().height;
-    const numPages = pdfDoc.pages.length;
-    if (numPages <= 1) return 0;
-    return (containerHeight - totalRenderedHeight) / (numPages - 1);
-  }
-
-  /** Highlight all words of a sentence. */
+  /** Highlight all words of a sentence using a native PDF highlight annotation. */
   function updateHighlightForSentence(sentence: Sentence) {
-    if (!registry || !pdfDoc) { clearHighlight(); return; }
+    clearHighlight();
+    if (!registry || !pdfDoc || sentence.words.length === 0) return;
 
-    const store = registry.getStore();
-    const state = store.getState();
-    const activeDocId = state.core.activeDocumentId;
-    if (!activeDocId) { clearHighlight(); return; }
+    const annoPlugin = registry.getPlugin('annotation') as any;
+    if (!annoPlugin) return;
 
-    const docState = state.core.documents[activeDocId];
-    if (!docState?.document) { clearHighlight(); return; }
-
-    const scale = docState.scale;
-    const gap = getPageGap();
-
-    const rects: Array<{ x: number; y: number; width: number; height: number }> = [];
+    // Group word rects by line (same Y within tolerance) for cleaner highlights
+    const lineRects: Array<{ origin: { x: number; y: number }; size: { width: number; height: number } }> = [];
+    let lineY = -1;
+    let current: typeof lineRects[0] | null = null;
 
     for (const word of sentence.words) {
-      const page = docState.document.pages[word.pageIndex];
-      if (!page) continue;
+      const r = word.pdfRect;
+      if (r.size.width === 0 && r.size.height === 0) continue;
 
-      let pageTopY = 0;
-      for (let i = 0; i < word.pageIndex; i++) {
-        pageTopY += pdfDoc.pages[i].size.height * scale + gap;
+      if (current === null || Math.abs(r.origin.y - lineY) > 3) {
+        if (current) lineRects.push(current);
+        lineY = r.origin.y;
+        current = { origin: { x: r.origin.x, y: r.origin.y }, size: { width: r.size.width, height: r.size.height } };
+      } else {
+        const endX = r.origin.x + r.size.width;
+        current.size.width = endX - current.origin.x;
+        current.size.height = Math.max(current.size.height, r.size.height);
       }
+    }
+    if (current) lineRects.push(current);
+    if (lineRects.length === 0) return;
 
-      rects.push({
-        x: word.pdfRect.origin.x * scale,
-        y: pageTopY + word.pdfRect.origin.y * scale,
-        width: word.pdfRect.size.width * scale,
-        height: word.pdfRect.size.height * scale,
+    // Bounding rect
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const r of lineRects) {
+      minX = Math.min(minX, r.origin.x);
+      minY = Math.min(minY, r.origin.y);
+      maxX = Math.max(maxX, r.origin.x + r.size.width);
+      maxY = Math.max(maxY, r.origin.y + r.size.height);
+    }
+
+    const annoId = `tts-hl-${Date.now()}`;
+    const pageIndex = sentence.pageIndex;
+
+    try {
+      annoPlugin.createAnnotation(pageIndex, {
+        id: annoId,
+        type: 9, // PdfAnnotationSubtype.HIGHLIGHT
+        pageIndex,
+        rect: { origin: { x: minX, y: minY }, size: { width: maxX - minX, height: maxY - minY } },
+        segmentRects: lineRects,
+        strokeColor: '#4285F4',
+        opacity: 0.35,
       });
-    }
+      currentHighlightId = annoId;
+      currentHighlightPage = pageIndex;
+    } catch {}
 
-    highlightRects = rects;
-
-    // Scroll first rect into view
-    if (rects.length > 0) {
-      scrollHighlightIntoView();
-    }
+    // Scroll highlight into view via the scroll plugin
+    scrollHighlightIntoView(pageIndex, minY);
   }
 
   /** Scroll to make the current highlight visible. */
-  function scrollHighlightIntoView() {
-    const container = document.querySelector('embedpdf-container');
-    const sr = container?.shadowRoot;
-    if (!sr) return;
-    const overlay = sr.querySelector('.tts-highlight-layer .reading-highlight-overlay');
-    if (overlay) {
-      overlay.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
+  function scrollHighlightIntoView(pageIndex: number, pdfY: number) {
+    if (!registry) return;
+    try {
+      const scrollPlugin = registry.getPlugin('scroll') as any;
+      const store = registry.getStore();
+      const state = store.getState();
+      const docId = state.core.activeDocumentId;
+      if (!docId || !scrollPlugin) return;
+
+      // Use getRectPositionForPage to convert PDF coords to scroll position
+      const pos = scrollPlugin.getRectPositionForPage?.(docId, pageIndex, { origin: { x: 0, y: pdfY }, size: { width: 1, height: 20 } });
+      if (pos !== undefined && pos !== null) {
+        const scrollEl = document.querySelector('embedpdf-container')?.shadowRoot?.querySelector('.bg-bg-app');
+        if (scrollEl) {
+          const currentScroll = scrollEl.scrollTop;
+          const viewHeight = scrollEl.clientHeight;
+          // Only scroll if highlight is outside the visible area
+          if (pos < currentScroll || pos > currentScroll + viewHeight - 100) {
+            scrollEl.scrollTo({ top: Math.max(0, pos - viewHeight / 3), behavior: 'smooth' });
+          }
+        }
+      }
+    } catch {}
   }
 
   // --- Controls handlers ---
@@ -707,17 +719,19 @@
     }
   }
 
-  // --- Keyboard shortcuts ---
+  // --- Keyboard shortcuts (capture phase to intercept before EmbedPDF's shadow DOM) ---
   function handleKeydown(e: KeyboardEvent) {
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
 
     switch (e.code) {
       case 'Space':
         e.preventDefault();
+        e.stopPropagation();
         handlePlayClick();
         break;
       case 'ArrowLeft':
         e.preventDefault();
+        e.stopPropagation();
         if (currentSentenceIndex > 0) {
           currentSentenceIndex--;
           if (isPlaying) startPlaybackFrom(currentSentenceIndex);
@@ -725,6 +739,7 @@
         break;
       case 'ArrowRight':
         e.preventDefault();
+        e.stopPropagation();
         if (currentSentenceIndex < sentences.length - 1) {
           currentSentenceIndex++;
           if (isPlaying) startPlaybackFrom(currentSentenceIndex);
@@ -732,14 +747,17 @@
         break;
       case 'ArrowUp':
         e.preventDefault();
+        e.stopPropagation();
         handleSpeedChange(Math.min(3.0, speed + 0.25));
         break;
       case 'ArrowDown':
         e.preventDefault();
+        e.stopPropagation();
         handleSpeedChange(Math.max(0.5, speed - 0.25));
         break;
       case 'Escape':
         e.preventDefault();
+        e.stopPropagation();
         if (playbackAbort) playbackAbort.abort();
         audioPipeline.stop();
         isPlaying = false;
@@ -748,9 +766,14 @@
         break;
     }
   }
+
+  $effect(() => {
+    window.addEventListener('keydown', handleKeydown, { capture: true });
+    return () => window.removeEventListener('keydown', handleKeydown, { capture: true });
+  });
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
+
 
 {#if !pdfSrc}
   <!-- Drop zone / file picker -->
@@ -778,7 +801,6 @@
   </div>
 {:else}
   <PdfViewer src={pdfSrc} onregistryready={handleRegistryReady} />
-  <Highlight rects={highlightRects} {registry} />
   <Controls
     isPlaying={isPlaying && !isPaused}
     {speed}
