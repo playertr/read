@@ -20,6 +20,10 @@
     text: string;
     pageIndex: number;
     words: Word[];
+    /** Start char index within the page (EmbedPDF charIndex). */
+    charStartInPage: number;
+    /** End char index (exclusive) within the page. */
+    charEndInPage: number;
   }
 
   // --- State ---
@@ -198,6 +202,14 @@
       const rawSentences = splitIntoSentences(fullText);
       let charOffset = 0;
 
+      // Build mapping: paragraph char offset → page-level charIndex
+      const paraCharToPage: number[] = [];
+      for (const run of paraRuns) {
+        for (let c = 0; c < run.text.length; c++) {
+          paraCharToPage.push(run.charIndex + c);
+        }
+      }
+
       for (const sentText of rawSentences) {
         const sentStart = fullText.indexOf(sentText, charOffset);
         if (sentStart < 0) continue;
@@ -207,10 +219,16 @@
         // Map sentence chars back to runs to get word-level rects
         const words = extractWordsFromRuns(sentText, sentStart, paraRuns, page.index, glyphs);
 
+        // Map to page-level char indices
+        const charStartInPage = sentStart < paraCharToPage.length ? paraCharToPage[sentStart] : 0;
+        const charEndInPage = sentEnd <= paraCharToPage.length ? paraCharToPage[sentEnd - 1] + 1 : charStartInPage + sentText.length;
+
         result.push({
           text: sentText,
           pageIndex: page.index,
           words,
+          charStartInPage,
+          charEndInPage,
         });
       }
     }
@@ -553,58 +571,64 @@
     ttsCache.clear();
   }
 
-  function handleSentenceClick(event: { text: string; pageIndex: number }) {
-    const selectedText = event.text.trim();
-    if (!selectedText) return;
-
-    // Extract the first complete word from the selection
-    const firstWordMatch = selectedText.match(/\b(\w+)\b/);
-    if (!firstWordMatch) return;
-    const firstWord = firstWordMatch[1].toLowerCase();
-
-    // Find the sentence whose words contain this first selected word,
-    // preferring matches on the same page
-    let bestIndex = -1;
-
+  /**
+   * Given a page index and a char index within that page (from the selection plugin),
+   * find the sentence that contains this position and update currentSentenceIndex.
+   */
+  function selectSentenceAtCharIndex(pageIndex: number, charIndex: number) {
     for (let i = 0; i < sentences.length; i++) {
       const s = sentences[i];
-      if (s.pageIndex !== event.pageIndex) continue;
-
-      for (const w of s.words) {
-        if (w.text.toLowerCase() === firstWord ||
-            w.text.toLowerCase().startsWith(firstWord) ||
-            firstWord.startsWith(w.text.toLowerCase())) {
-          bestIndex = i;
-          break;
+      if (s.pageIndex !== pageIndex) continue;
+      if (charIndex >= s.charStartInPage && charIndex < s.charEndInPage) {
+        currentSentenceIndex = i;
+        updateHighlightForSentence(s);
+        if (isPlaying && !isPaused) {
+          startPlaybackFrom(i);
         }
+        return;
       }
-      if (bestIndex >= 0) break;
     }
+  }
 
-    // Fallback: fuzzy match on sentence text
-    if (bestIndex < 0) {
-      for (let i = 0; i < sentences.length; i++) {
-        if (sentences[i].pageIndex !== event.pageIndex) continue;
-        if (sentences[i].text.toLowerCase().includes(firstWord)) {
-          bestIndex = i;
-          break;
-        }
-      }
-    }
+  /**
+   * Wire up selection detection by polling the EmbedPDF selection plugin
+   * on mouseup events within the shadow DOM.
+   */
+  function wireSelectionDetection(reg: PluginRegistry) {
+    const selPlugin = reg.getPlugin('selection') as any;
+    if (!selPlugin) return;
 
-    if (bestIndex >= 0) {
-      currentSentenceIndex = bestIndex;
-      updateHighlightForSentence(sentences[bestIndex]);
-      if (isPlaying && !isPaused) {
-        startPlaybackFrom(bestIndex);
-      }
-    }
+    const container = document.querySelector('embedpdf-container');
+    const sr = container?.shadowRoot;
+    if (!sr) return;
+
+    const scrollEl = sr.querySelector('.bg-bg-app');
+    if (!scrollEl) return;
+
+    scrollEl.addEventListener('mouseup', () => {
+      // Delay to let the selection plugin finalize its state
+      setTimeout(() => {
+        const store = reg.getStore();
+        const state = store.getState();
+        const docId = state.core.activeDocumentId;
+        if (!docId) return;
+
+        const docState = selPlugin.getDocumentState(docId);
+        if (!docState?.selection?.start) return;
+
+        const { page, index } = docState.selection.start;
+        selectSentenceAtCharIndex(page, index);
+      }, 150);
+    });
   }
 
   // --- Registry ready handler ---
   function handleRegistryReady(reg: PluginRegistry) {
     registry = reg;
     engine = reg.getEngine();
+
+    // Expose registry globally for debugging
+    (window as any).__registry = reg;
 
     // Listen for document loads
     const store = reg.getStore();
@@ -627,6 +651,9 @@
           }
         }
       }
+
+      // Wire selection detection after shadow DOM renders the pages
+      setTimeout(() => wireSelectionDetection(reg), 500);
     });
   }
 
@@ -750,7 +777,7 @@
     </div>
   </div>
 {:else}
-  <PdfViewer src={pdfSrc} onsentenceclick={handleSentenceClick} onregistryready={handleRegistryReady} />
+  <PdfViewer src={pdfSrc} onregistryready={handleRegistryReady} />
   <Highlight rects={highlightRects} {registry} />
   <Controls
     isPlaying={isPlaying && !isPaused}

@@ -7,11 +7,9 @@
     src: string | null;
     /** Fired when the plugin registry is ready. */
     onregistryready?: (registry: PluginRegistry) => void;
-    /** Fired when user selects text (for "play from here"). */
-    onsentenceclick?: (event: { text: string; pageIndex: number }) => void;
   }
 
-  let { src, onregistryready, onsentenceclick }: Props = $props();
+  let { src, onregistryready }: Props = $props();
 
   let container: EmbedPdfContainer | null = $state(null);
 
@@ -21,27 +19,6 @@
 
   function handleReady(registry: PluginRegistry) {
     onregistryready?.(registry);
-
-    // Hook up text selection for "play from here"
-    if (onsentenceclick) {
-      const selection = registry.getPlugin('selection');
-      if (selection) {
-        const cap = selection as any;
-        if (cap.onSelectionChange) {
-          cap.onSelectionChange((event: any) => {
-            if (event.selection) {
-              const startPage = event.selection.start.page;
-              cap.getSelectedText?.(event.documentId)?.toPromise?.().then((texts: string[]) => {
-                const text = texts.join(' ').trim();
-                if (text) {
-                  onsentenceclick!({ text, pageIndex: startPage });
-                }
-              });
-            }
-          });
-        }
-      }
-    }
   }
 </script>
 
