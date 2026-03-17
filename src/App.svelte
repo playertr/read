@@ -403,7 +403,6 @@
 
       currentSentenceIndex = i;
       const sentence = sentences[i];
-      const words = sentence.words;
 
       // Start generating next sentence while current plays
       if (i + 2 < sentences.length) generateSpeech(sentences[i + 2].text);
@@ -418,39 +417,14 @@
 
       if (signal.aborted) break;
 
-      // Compute proportional word timing (fraction of audio for each word)
-      const wordTimings = computeWordTimings(words, sentence.text);
-
-      // Start playing the sentence audio
-      // Highlight first word immediately
-      if (words.length > 0) updateHighlightForWord(words[0]);
-
-      let playbackDone = false;
-      const playPromise = audioPipeline.play(audioData.audio, audioData.sampleRate);
-      playPromise.then(() => { playbackDone = true; }).catch(() => { playbackDone = true; });
-
-      // Poll progress via setInterval to avoid async timing race
-      let lastWordIdx = -1;
-      const highlightTimer = setInterval(() => {
-        if (playbackDone || signal.aborted) {
-          clearInterval(highlightTimer);
-          return;
-        }
-        const progress = audioPipeline.getProgress();
-        const wordIdx = getWordIndexAtProgress(wordTimings, progress);
-        if (wordIdx !== lastWordIdx && wordIdx >= 0 && wordIdx < words.length) {
-          lastWordIdx = wordIdx;
-          updateHighlightForWord(words[wordIdx]);
-        }
-      }, 30);
+      // Highlight the entire sentence
+      updateHighlightForSentence(sentence);
 
       try {
-        await playPromise;
+        await audioPipeline.play(audioData.audio, audioData.sampleRate);
       } catch (playErr) {
         console.error(`[Playback] Play error:`, playErr);
         break;
-      } finally {
-        clearInterval(highlightTimer);
       }
 
       if (signal.aborted) break;
@@ -460,28 +434,6 @@
       isPlaying = false;
       clearHighlight();
     }
-  }
-
-  /** Compute cumulative timing fractions for each word based on character length. */
-  function computeWordTimings(words: Word[], sentenceText: string): number[] {
-    const totalChars = words.reduce((sum, w) => sum + w.text.length, 0);
-    if (totalChars === 0) return words.map(() => 1);
-
-    const fractions: number[] = [];
-    let cum = 0;
-    for (const w of words) {
-      cum += w.text.length / totalChars;
-      fractions.push(cum);
-    }
-    return fractions;
-  }
-
-  /** Find which word should be highlighted at a given playback progress (0–1). */
-  function getWordIndexAtProgress(timings: number[], progress: number): number {
-    for (let i = 0; i < timings.length; i++) {
-      if (progress < timings[i]) return i;
-    }
-    return timings.length - 1;
   }
 
 
@@ -518,9 +470,8 @@
     return (containerHeight - totalRenderedHeight) / (numPages - 1);
   }
 
-  /** Highlight a single word using its PDF rect, positioned absolutely in the
-   *  document container's coordinate space. */
-  function updateHighlightForWord(word: Word) {
+  /** Highlight all words of a sentence. */
+  function updateHighlightForSentence(sentence: Sentence) {
     if (!registry || !pdfDoc) { clearHighlight(); return; }
 
     const store = registry.getStore();
@@ -531,25 +482,45 @@
     const docState = state.core.documents[activeDocId];
     if (!docState?.document) { clearHighlight(); return; }
 
-    const page = docState.document.pages[word.pageIndex];
-    if (!page) { clearHighlight(); return; }
-
     const scale = docState.scale;
     const gap = getPageGap();
 
-    // Compute page top offset within the document container
-    let pageTopY = 0;
-    for (let i = 0; i < word.pageIndex; i++) {
-      pageTopY += pdfDoc.pages[i].size.height * scale + gap;
+    const rects: Array<{ x: number; y: number; width: number; height: number }> = [];
+
+    for (const word of sentence.words) {
+      const page = docState.document.pages[word.pageIndex];
+      if (!page) continue;
+
+      let pageTopY = 0;
+      for (let i = 0; i < word.pageIndex; i++) {
+        pageTopY += pdfDoc.pages[i].size.height * scale + gap;
+      }
+
+      rects.push({
+        x: word.pdfRect.origin.x * scale,
+        y: pageTopY + word.pdfRect.origin.y * scale,
+        width: word.pdfRect.size.width * scale,
+        height: word.pdfRect.size.height * scale,
+      });
     }
 
-    // EmbedPDF uses top-left origin (y increases downward), no flip needed
-    const x = word.pdfRect.origin.x * scale;
-    const y = pageTopY + word.pdfRect.origin.y * scale;
-    const width = word.pdfRect.size.width * scale;
-    const height = word.pdfRect.size.height * scale;
+    highlightRects = rects;
 
-    highlightRects = [{ x, y, width, height }];
+    // Scroll first rect into view
+    if (rects.length > 0) {
+      scrollHighlightIntoView();
+    }
+  }
+
+  /** Scroll to make the current highlight visible. */
+  function scrollHighlightIntoView() {
+    const container = document.querySelector('embedpdf-container');
+    const sr = container?.shadowRoot;
+    if (!sr) return;
+    const overlay = sr.querySelector('.tts-highlight-layer .reading-highlight-overlay');
+    if (overlay) {
+      overlay.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
   }
 
   // --- Controls handlers ---
@@ -585,38 +556,45 @@
   function handleSentenceClick(event: { text: string; pageIndex: number }) {
     const selectedText = event.text.trim();
     if (!selectedText) return;
-    const selectedLower = selectedText.toLowerCase();
 
+    // Extract the first complete word from the selection
+    const firstWordMatch = selectedText.match(/\b(\w+)\b/);
+    if (!firstWordMatch) return;
+    const firstWord = firstWordMatch[1].toLowerCase();
+
+    // Find the sentence whose words contain this first selected word,
+    // preferring matches on the same page
     let bestIndex = -1;
-    let bestScore = -1;
 
     for (let i = 0; i < sentences.length; i++) {
       const s = sentences[i];
       if (s.pageIndex !== event.pageIndex) continue;
-      const sentLower = s.text.toLowerCase();
 
-      let score = 0;
-      const probe = selectedLower.substring(0, Math.min(20, selectedLower.length));
-      if (sentLower.includes(probe)) {
-        score = selectedText.length;
-      } else if (selectedLower.includes(sentLower.substring(0, Math.min(20, sentLower.length)))) {
-        score = sentLower.length;
-      } else if (sentLower.includes(selectedLower) || selectedLower.includes(sentLower)) {
-        score = Math.min(selectedText.length, sentLower.length);
+      for (const w of s.words) {
+        if (w.text.toLowerCase() === firstWord ||
+            w.text.toLowerCase().startsWith(firstWord) ||
+            firstWord.startsWith(w.text.toLowerCase())) {
+          bestIndex = i;
+          break;
+        }
       }
+      if (bestIndex >= 0) break;
+    }
 
-      if (score > bestScore) {
-        bestScore = score;
-        bestIndex = i;
+    // Fallback: fuzzy match on sentence text
+    if (bestIndex < 0) {
+      for (let i = 0; i < sentences.length; i++) {
+        if (sentences[i].pageIndex !== event.pageIndex) continue;
+        if (sentences[i].text.toLowerCase().includes(firstWord)) {
+          bestIndex = i;
+          break;
+        }
       }
     }
 
     if (bestIndex >= 0) {
       currentSentenceIndex = bestIndex;
-      const sentence = sentences[bestIndex];
-      if (sentence.words.length > 0) {
-        updateHighlightForWord(sentence.words[0]);
-      }
+      updateHighlightForSentence(sentences[bestIndex]);
       if (isPlaying && !isPaused) {
         startPlaybackFrom(bestIndex);
       }
