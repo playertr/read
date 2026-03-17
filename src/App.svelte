@@ -380,7 +380,7 @@
   // --- Playback loop ---
   let playbackAbort: AbortController | null = null;
 
-  async function startPlaybackFrom(index: number, wordOffset = 0) {
+  async function startPlaybackFrom(index: number) {
     if (playbackAbort) {
       playbackAbort.abort();
     }
@@ -394,6 +394,10 @@
     isPaused = false;
     currentSentenceIndex = index;
 
+    // Pre-generate the first sentence + lookahead
+    if (index < sentences.length) generateSpeech(sentences[index].text);
+    if (index + 1 < sentences.length) generateSpeech(sentences[index + 1].text);
+
     for (let i = index; i < sentences.length; i++) {
       if (signal.aborted) break;
 
@@ -401,37 +405,55 @@
       const sentence = sentences[i];
       const words = sentence.words;
 
-      // Fire TTS for all words in this sentence (and next sentence)
-      const startWord = i === index ? wordOffset : 0;
-      const wordPromises = words.map((w) => generateSpeech(w.text));
-      if (i + 1 < sentences.length) {
-        sentences[i + 1].words.forEach((w) => generateSpeech(w.text));
+      // Start generating next sentence while current plays
+      if (i + 2 < sentences.length) generateSpeech(sentences[i + 2].text);
+
+      let audioData: { audio: Float32Array; sampleRate: number };
+      try {
+        audioData = await generateSpeech(sentence.text);
+      } catch (err) {
+        console.error(`TTS failed for sentence:`, err);
+        continue;
       }
 
-      for (let w = startWord; w < words.length; w++) {
-        if (signal.aborted) break;
+      if (signal.aborted) break;
 
-        let audioData: { audio: Float32Array; sampleRate: number };
-        try {
-          audioData = await wordPromises[w];
-        } catch (err) {
-          console.error(`TTS failed for word "${words[w].text}":`, err);
-          continue;
+      // Compute proportional word timing (fraction of audio for each word)
+      const wordTimings = computeWordTimings(words, sentence.text);
+
+      // Start playing the sentence audio
+      // Highlight first word immediately
+      if (words.length > 0) updateHighlightForWord(words[0]);
+
+      let playbackDone = false;
+      const playPromise = audioPipeline.play(audioData.audio, audioData.sampleRate);
+      playPromise.then(() => { playbackDone = true; }).catch(() => { playbackDone = true; });
+
+      // Poll progress via setInterval to avoid async timing race
+      let lastWordIdx = -1;
+      const highlightTimer = setInterval(() => {
+        if (playbackDone || signal.aborted) {
+          clearInterval(highlightTimer);
+          return;
         }
-
-        if (signal.aborted) break;
-
-        updateHighlightForWord(words[w]);
-
-        try {
-          await audioPipeline.play(audioData.audio, audioData.sampleRate);
-        } catch (playErr) {
-          console.error(`[Playback] Play error:`, playErr);
-          break;
+        const progress = audioPipeline.getProgress();
+        const wordIdx = getWordIndexAtProgress(wordTimings, progress);
+        if (wordIdx !== lastWordIdx && wordIdx >= 0 && wordIdx < words.length) {
+          lastWordIdx = wordIdx;
+          updateHighlightForWord(words[wordIdx]);
         }
+      }, 30);
 
-        if (signal.aborted) break;
+      try {
+        await playPromise;
+      } catch (playErr) {
+        console.error(`[Playback] Play error:`, playErr);
+        break;
+      } finally {
+        clearInterval(highlightTimer);
       }
+
+      if (signal.aborted) break;
     }
 
     if (!signal.aborted) {
@@ -439,6 +461,29 @@
       clearHighlight();
     }
   }
+
+  /** Compute cumulative timing fractions for each word based on character length. */
+  function computeWordTimings(words: Word[], sentenceText: string): number[] {
+    const totalChars = words.reduce((sum, w) => sum + w.text.length, 0);
+    if (totalChars === 0) return words.map(() => 1);
+
+    const fractions: number[] = [];
+    let cum = 0;
+    for (const w of words) {
+      cum += w.text.length / totalChars;
+      fractions.push(cum);
+    }
+    return fractions;
+  }
+
+  /** Find which word should be highlighted at a given playback progress (0–1). */
+  function getWordIndexAtProgress(timings: number[], progress: number): number {
+    for (let i = 0; i < timings.length; i++) {
+      if (progress < timings[i]) return i;
+    }
+    return timings.length - 1;
+  }
+
 
   function clearHighlight() {
     highlightRects = [];

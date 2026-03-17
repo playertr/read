@@ -124,6 +124,21 @@ export class AudioPipeline {
     return this._isPlaying;
   }
 
+  /** Get playback progress as a fraction (0.0–1.0) of the current buffer. */
+  getProgress(): number {
+    if (!this._isPlaying || !this.currentPcm || this.currentPcm.length === 0) return 0;
+    const offset = this.getPlaybackOffset();
+    // Account for PICOLA scaling: offset is in scaled-buffer samples,
+    // but we want progress through the original audio
+    if (this._tempo === 1.0) {
+      return Math.min(1.0, offset / this.currentPcm.length);
+    } else {
+      // Scaled buffer is shorter/longer by 1/tempo factor
+      const scaledLen = Math.round(this.currentPcm.length / this._tempo);
+      return Math.min(1.0, offset / Math.max(1, scaledLen));
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Internal helpers
   // ---------------------------------------------------------------------------
