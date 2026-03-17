@@ -406,6 +406,9 @@
     playbackAbort = new AbortController();
     const signal = playbackAbort.signal;
 
+    // Clear any lingering EmbedPDF text selection to avoid double-highlight
+    clearEmbedSelection();
+
     await audioPipeline.init();
     if (signal.aborted) return;
     audioPipeline.setSpeed(speed);
@@ -465,6 +468,20 @@
     }
     currentHighlightId = null;
     currentHighlightPage = -1;
+  }
+
+  /** Clear EmbedPDF's native text selection to avoid visual overlap with our annotation. */
+  function clearEmbedSelection() {
+    if (!registry) return;
+    try {
+      const selPlugin = registry.getPlugin('selection') as any;
+      const cap = selPlugin?._capability;
+      const store = registry.getStore();
+      const docId = store.getState().core.activeDocumentId;
+      if (cap?.clear && docId) {
+        cap.clear(docId);
+      }
+    } catch {}
   }
 
   /** Highlight all words of a sentence using a native PDF highlight annotation. */
