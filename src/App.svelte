@@ -1,22 +1,29 @@
 <script lang="ts">
   import './app.css';
-  import * as pdfjsLib from 'pdfjs-dist';
-  import type { PDFDocumentProxy } from 'pdfjs-dist';
+  import type { PluginRegistry } from '@embedpdf/svelte-pdf-viewer';
+  import type { PdfDocumentObject, PdfEngine, PdfPageObject, PdfTextRun } from '@embedpdf/models';
   import PdfViewer from './lib/components/PdfViewer.svelte';
   import Controls from './lib/components/Controls.svelte';
   import Highlight from './lib/components/Highlight.svelte';
-  import { extractSentences, type Sentence } from './lib/pdf-text';
   import { AudioPipeline } from './lib/audio-pipeline';
   import type { WorkerOutgoing } from './lib/tts-worker';
 
-  // Set pdf.js worker
-  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-    'pdfjs-dist/build/pdf.worker.mjs',
-    import.meta.url
-  ).href;
+  // --- Types for our text model ---
+  interface Word {
+    text: string;
+    pageIndex: number;
+    /** Bounding rect in PDF page coordinates (points). Uses EmbedPDF Rect format. */
+    pdfRect: { origin: { x: number; y: number }; size: { width: number; height: number } };
+  }
+
+  interface Sentence {
+    text: string;
+    pageIndex: number;
+    words: Word[];
+  }
 
   // --- State ---
-  let pdf: PDFDocumentProxy | null = $state(null);
+  let pdfSrc: string | null = $state(null);
   let sentences: Sentence[] = $state([]);
   let currentSentenceIndex = $state(0);
   let isPlaying = $state(false);
@@ -27,8 +34,14 @@
   let isLoading = $state(true);
   let loadingMessage = $state('Detecting device…');
   let ttsDevice = $state('');
-  let activeSentenceSpans: HTMLElement[] = $state([]);
-  let pdfViewer: PdfViewer | undefined = $state();
+
+  // EmbedPDF references
+  let registry: PluginRegistry | null = $state(null);
+  let engine: PdfEngine | null = $state(null);
+  let pdfDoc: PdfDocumentObject | null = $state(null);
+
+  // Highlight state: overlay rects in absolute document-container coords (CSS px)
+  let highlightRects: Array<{ x: number; y: number; width: number; height: number }> = $state([]);
 
   // --- Audio ---
   const audioPipeline = new AudioPipeline();
@@ -95,54 +108,283 @@
   // Initialize TTS
   ttsWorker.postMessage({ type: 'init' });
 
-  // --- TTS generation helper ---
+  // --- TTS generation with dedup cache ---
+  const ttsCache = new Map<string, Promise<{ audio: Float32Array; sampleRate: number }>>();
+
   function generateSpeech(text: string): Promise<{ audio: Float32Array; sampleRate: number }> {
-    return new Promise((resolve, reject) => {
+    const cached = ttsCache.get(text);
+    if (cached) return cached;
+
+    const promise = new Promise<{ audio: Float32Array; sampleRate: number }>((resolve, reject) => {
       const id = ++generateId;
       pendingAudio.set(id, { resolve, reject });
       ttsWorker.postMessage({ type: 'generate', id, text, voice, speed: 1.0 });
     });
-  }
+    ttsCache.set(text, promise);
 
-  // --- Lookahead buffer ---
-  // Fire TTS generation ahead of playback so audio is ready when needed.
-  // The first sentence plays as soon as its audio arrives (no pre-buffering).
-  const LOOKAHEAD = 3;
-
-  interface BufferedAudio {
-    sentenceIndex: number;
-    promise: Promise<{ audio: Float32Array; sampleRate: number }>;
-  }
-
-  let audioBuffer: BufferedAudio[] = [];
-
-  /** Request TTS for a sentence (deduplicates). Returns a promise for the audio. */
-  function ensurePrefetched(sentenceIndex: number): Promise<{ audio: Float32Array; sampleRate: number }> {
-    if (sentenceIndex >= sentences.length) {
-      return Promise.reject(new Error("past end"));
+    if (ttsCache.size > 200) {
+      const first = ttsCache.keys().next().value;
+      if (first !== undefined) ttsCache.delete(first);
     }
-
-    const existing = audioBuffer.find((b) => b.sentenceIndex === sentenceIndex);
-    if (existing) return existing.promise;
-
-    const promise = generateSpeech(sentences[sentenceIndex].text);
-    audioBuffer.push({ sentenceIndex, promise });
-
-    // Keep buffer bounded
-    if (audioBuffer.length > LOOKAHEAD + 2) {
-      audioBuffer = audioBuffer.slice(-LOOKAHEAD - 2);
-    }
-
     return promise;
+  }
+
+  // --- Text extraction from PDFium ---
+  async function extractTextFromDoc(eng: PdfEngine, doc: PdfDocumentObject) {
+    const allSentences: Sentence[] = [];
+
+    for (const page of doc.pages) {
+      try {
+        const [textRuns, geometry] = await Promise.all([
+          eng.getPageTextRuns(doc, page).toPromise(),
+          eng.getPageGeometry(doc, page).toPromise(),
+        ]);
+        // Build a flat array of glyph boxes indexed by char position
+        const glyphs = buildGlyphIndex(geometry.runs);
+        const pageSentences = textRunsToSentences(textRuns.runs, page, glyphs);
+        allSentences.push(...pageSentences);
+      } catch (err) {
+        console.warn(`Text extraction failed for page ${page.index}:`, err);
+      }
+    }
+
+    sentences = allSentences;
+    currentSentenceIndex = 0;
+    console.log(`Extracted ${sentences.length} sentences from ${doc.pageCount} pages`);
+  }
+
+  interface GlyphBox { x: number; y: number; width: number; height: number }
+
+  /** Build a char-index → glyph-box map from geometry runs. */
+  function buildGlyphIndex(runs: Array<{ charStart: number; glyphs: GlyphBox[] }>): Map<number, GlyphBox> {
+    const map = new Map<number, GlyphBox>();
+    for (const run of runs) {
+      for (let i = 0; i < run.glyphs.length; i++) {
+        map.set(run.charStart + i, run.glyphs[i]);
+      }
+    }
+    return map;
+  }
+
+  /**
+   * Convert PDFium PdfTextRun[] into Sentence/Word arrays.
+   * Groups runs into paragraphs, then splits into sentences.
+   */
+  function textRunsToSentences(runs: PdfTextRun[], page: PdfPageObject, glyphs: Map<number, GlyphBox>): Sentence[] {
+    if (runs.length === 0) return [];
+
+    // Group runs into paragraphs by detecting large Y gaps or font size changes
+    const paragraphs: PdfTextRun[][] = [[]];
+    for (let i = 0; i < runs.length; i++) {
+      const run = runs[i];
+      if (i > 0) {
+        const prev = runs[i - 1];
+        if (isParagraphBreakRun(prev, run, page.size.height)) {
+          if (paragraphs[paragraphs.length - 1].length > 0) {
+            paragraphs.push([]);
+          }
+        }
+      }
+      paragraphs[paragraphs.length - 1].push(run);
+    }
+
+    // For each paragraph, concatenate text, split into sentences
+    const result: Sentence[] = [];
+    for (const paraRuns of paragraphs) {
+      if (paraRuns.length === 0) continue;
+      const fullText = paraRuns.map(r => r.text).join('');
+      if (fullText.trim().length === 0) continue;
+
+      const rawSentences = splitIntoSentences(fullText);
+      let charOffset = 0;
+
+      for (const sentText of rawSentences) {
+        const sentStart = fullText.indexOf(sentText, charOffset);
+        if (sentStart < 0) continue;
+        const sentEnd = sentStart + sentText.length;
+        charOffset = sentEnd;
+
+        // Map sentence chars back to runs to get word-level rects
+        const words = extractWordsFromRuns(sentText, sentStart, paraRuns, page.index, glyphs);
+
+        result.push({
+          text: sentText,
+          pageIndex: page.index,
+          words,
+        });
+      }
+    }
+
+    return result;
+  }
+
+  /** Detect paragraph breaks between consecutive text runs. */
+  function isParagraphBreakRun(
+    prev: PdfTextRun,
+    curr: PdfTextRun,
+    pageHeight: number,
+  ): boolean {
+    // EmbedPDF coords: Y increases downward. Runs going down = increasing Y.
+    const prevY = prev.rect.origin.y;
+    const currY = curr.rect.origin.y;
+    const yDelta = currY - prevY; // positive = moved down
+
+    // Column break (going back up) — not a paragraph break
+    if (yDelta < 0) return false;
+
+    // Font size change > 25%
+    const avgFs = (prev.fontSize + curr.fontSize) / 2;
+    if (avgFs > 0 && Math.abs(prev.fontSize - curr.fontSize) / avgFs > 0.25) return true;
+
+    // Font change at line break
+    if (yDelta > 0 && prev.font.name !== curr.font.name) return true;
+
+    // Large Y gap (> 2.5× font size)
+    if (yDelta > prev.fontSize * 2.52) return true;
+
+    return false;
+  }
+
+  /** Split text into sentences (reusing abbreviation-aware logic). */
+  function splitIntoSentences(text: string): string[] {
+    const ABBREVIATIONS = new Set([
+      "dr", "mr", "mrs", "ms", "prof", "sr", "jr", "st",
+      "fig", "figs", "eq", "eqs", "ref", "refs", "sec", "secs",
+      "vol", "vols", "no", "nos", "p", "pp", "ed", "eds",
+      "al", "et", "vs", "viz", "approx", "dept", "est", "govt",
+      "inc", "corp", "ltd", "assn", "natl", "intl",
+      "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+      "i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x",
+      "e", "g", "ie", "eg",
+    ]);
+
+    const raw: string[] = [];
+    let sentStart = 0;
+
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (ch !== '.' && ch !== '!' && ch !== '?') continue;
+
+      let endPunct = i;
+      while (endPunct + 1 < text.length && '.!?'.includes(text[endPunct + 1])) endPunct++;
+
+      const afterPunct = endPunct + 1;
+      if (afterPunct < text.length && !/\s/.test(text[afterPunct])) {
+        i = endPunct;
+        continue;
+      }
+
+      if (ch === '.') {
+        const before = text.slice(sentStart, i);
+        const match = before.match(/(\w+)$/);
+        if (match) {
+          if (ABBREVIATIONS.has(match[1].toLowerCase())) { i = endPunct; continue; }
+          if (/^[A-Z]$/.test(match[1])) { i = endPunct; continue; }
+        }
+        if (/\d$/.test(text.slice(sentStart, i))) {
+          const after = text.slice(afterPunct).trimStart();
+          if (after.length > 0 && !/^[A-Z]/.test(after)) { i = endPunct; continue; }
+        }
+      }
+
+      const sentEnd = afterPunct;
+      const s = text.slice(sentStart, sentEnd).trim();
+      if (s.length > 0) raw.push(s);
+      sentStart = sentEnd;
+      i = endPunct;
+    }
+
+    if (sentStart < text.length) {
+      const s = text.slice(sentStart).trim();
+      if (s.length > 0) raw.push(s);
+    }
+
+    // Merge short sentences
+    const MIN_LEN = 40;
+    const merged: string[] = [];
+    for (const s of raw) {
+      if (merged.length > 0 && (merged[merged.length - 1].length < MIN_LEN || s.length < MIN_LEN)) {
+        merged[merged.length - 1] += ' ' + s;
+      } else {
+        merged.push(s);
+      }
+    }
+
+    return merged;
+  }
+
+  /**
+   * Extract words from sentence text, mapping each word to its PDF bounding rect.
+   * Uses char indices to find which run(s) each word falls in.
+   */
+  function extractWordsFromRuns(
+    sentText: string,
+    sentStartInPara: number,
+    paraRuns: PdfTextRun[],
+    pageIndex: number,
+    glyphs: Map<number, GlyphBox>,
+  ): Word[] {
+    const words: Word[] = [];
+    const wordMatches = [...sentText.matchAll(/\S+/g)];
+
+    // Build a mapping from paragraph char offset → global charIndex
+    const charIndexMap: number[] = [];
+    for (const run of paraRuns) {
+      for (let c = 0; c < run.text.length; c++) {
+        charIndexMap.push(run.charIndex + c);
+      }
+    }
+
+    for (const m of wordMatches) {
+      const wordStart = sentStartInPara + m.index!;
+      const wordEnd = wordStart + m[0].length;
+
+      // Compute bounding rect from individual glyph boxes
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      let found = false;
+
+      for (let ci = wordStart; ci < wordEnd && ci < charIndexMap.length; ci++) {
+        const globalIdx = charIndexMap[ci];
+        const glyph = glyphs.get(globalIdx);
+        if (!glyph) continue;
+
+        if (!found) {
+          minX = glyph.x;
+          minY = glyph.y;
+          maxX = glyph.x + glyph.width;
+          maxY = glyph.y + glyph.height;
+          found = true;
+        } else {
+          minX = Math.min(minX, glyph.x);
+          minY = Math.min(minY, glyph.y);
+          maxX = Math.max(maxX, glyph.x + glyph.width);
+          maxY = Math.max(maxY, glyph.y + glyph.height);
+        }
+      }
+
+      if (found) {
+        words.push({
+          text: m[0],
+          pageIndex,
+          pdfRect: {
+            origin: { x: minX, y: minY },
+            size: { width: maxX - minX, height: maxY - minY },
+          },
+        });
+      }
+    }
+
+    return words;
   }
 
   // --- Playback loop ---
   let playbackAbort: AbortController | null = null;
 
-  async function startPlaybackFrom(index: number) {
+  async function startPlaybackFrom(index: number, wordOffset = 0) {
     if (playbackAbort) {
       playbackAbort.abort();
     }
+    audioPipeline.stop();
     playbackAbort = new AbortController();
     const signal = playbackAbort.signal;
 
@@ -152,103 +394,135 @@
     isPaused = false;
     currentSentenceIndex = index;
 
-    // Clear old buffer
-    audioBuffer = [];
-
-    // Immediately fire TTS for the first sentence + lookahead
-    for (let k = 0; k <= LOOKAHEAD && index + k < sentences.length; k++) {
-      ensurePrefetched(index + k);
-    }
-
     for (let i = index; i < sentences.length; i++) {
       if (signal.aborted) break;
 
       currentSentenceIndex = i;
+      const sentence = sentences[i];
+      const words = sentence.words;
 
-      // Fire lookahead for upcoming sentences
-      for (let k = 1; k <= LOOKAHEAD; k++) {
-        ensurePrefetched(i + k);
+      // Fire TTS for all words in this sentence (and next sentence)
+      const startWord = i === index ? wordOffset : 0;
+      const wordPromises = words.map((w) => generateSpeech(w.text));
+      if (i + 1 < sentences.length) {
+        sentences[i + 1].words.forEach((w) => generateSpeech(w.text));
       }
 
-      // Get audio (already prefetched or wait for it)
-      let audioData: { audio: Float32Array; sampleRate: number };
-      try {
-        audioData = await ensurePrefetched(i);
-      } catch (err) {
-        console.error(`TTS failed for sentence ${i}:`, err);
-        continue;
+      for (let w = startWord; w < words.length; w++) {
+        if (signal.aborted) break;
+
+        let audioData: { audio: Float32Array; sampleRate: number };
+        try {
+          audioData = await wordPromises[w];
+        } catch (err) {
+          console.error(`TTS failed for word "${words[w].text}":`, err);
+          continue;
+        }
+
+        if (signal.aborted) break;
+
+        updateHighlightForWord(words[w]);
+
+        try {
+          await audioPipeline.play(audioData.audio, audioData.sampleRate);
+        } catch (playErr) {
+          console.error(`[Playback] Play error:`, playErr);
+          break;
+        }
+
+        if (signal.aborted) break;
       }
-
-      if (signal.aborted) break;
-
-      // Set highlight RIGHT BEFORE play so it syncs with audio start
-      updateHighlight(i);
-
-      try {
-        await audioPipeline.play(audioData.audio, audioData.sampleRate);
-      } catch (playErr) {
-        console.error(`[Playback] Play error for sentence ${i}:`, playErr);
-        break;
-      }
-
-      if (signal.aborted) break;
     }
 
     if (!signal.aborted) {
       isPlaying = false;
-      activeSentenceSpans = [];
+      clearHighlight();
     }
   }
 
-  function updateHighlight(sentenceIndex: number) {
-    const sentence = sentences[sentenceIndex];
-    if (!sentence) {
-      activeSentenceSpans = [];
-      return;
-    }
+  function clearHighlight() {
+    highlightRects = [];
+  }
 
-    // pdf.js viewer uses data-page-number (1-indexed) and .textLayer
-    const pageContainer = document.querySelector(
-      `.page[data-page-number="${sentence.pageIndex + 1}"]`
+  /**
+   * Compute the gap (in CSS px) between pages in the EmbedPDF document container.
+   * The container height = numPages * pageHeight * scale + (numPages-1) * gap.
+   */
+  function getPageGap(): number {
+    const container = document.querySelector('embedpdf-container');
+    const sr = container?.shadowRoot;
+    if (!sr) return 10;
+    const scrollEl = sr.querySelector('.bg-bg-app');
+    const docContainer = scrollEl?.firstElementChild?.firstElementChild as HTMLElement | null;
+    if (!docContainer || !pdfDoc) return 10;
+
+    const store = registry!.getStore();
+    const state = store.getState();
+    const activeDocId = state.core.activeDocumentId;
+    if (!activeDocId) return 10;
+    const docState = state.core.documents[activeDocId];
+    if (!docState) return 10;
+
+    const scale = docState.scale;
+    const totalRenderedHeight = pdfDoc.pages.reduce(
+      (sum, p) => sum + p.size.height * scale, 0
     );
-    if (!pageContainer) {
-      activeSentenceSpans = [];
-      return;
+    const containerHeight = docContainer.getBoundingClientRect().height;
+    const numPages = pdfDoc.pages.length;
+    if (numPages <= 1) return 0;
+    return (containerHeight - totalRenderedHeight) / (numPages - 1);
+  }
+
+  /** Highlight a single word using its PDF rect, positioned absolutely in the
+   *  document container's coordinate space. */
+  function updateHighlightForWord(word: Word) {
+    if (!registry || !pdfDoc) { clearHighlight(); return; }
+
+    const store = registry.getStore();
+    const state = store.getState();
+    const activeDocId = state.core.activeDocumentId;
+    if (!activeDocId) { clearHighlight(); return; }
+
+    const docState = state.core.documents[activeDocId];
+    if (!docState?.document) { clearHighlight(); return; }
+
+    const page = docState.document.pages[word.pageIndex];
+    if (!page) { clearHighlight(); return; }
+
+    const scale = docState.scale;
+    const gap = getPageGap();
+
+    // Compute page top offset within the document container
+    let pageTopY = 0;
+    for (let i = 0; i < word.pageIndex; i++) {
+      pageTopY += pdfDoc.pages[i].size.height * scale + gap;
     }
 
-    const textLayer = pageContainer.querySelector('.textLayer');
-    if (!textLayer) {
-      activeSentenceSpans = [];
-      return;
-    }
+    // EmbedPDF uses top-left origin (y increases downward), no flip needed
+    const x = word.pdfRect.origin.x * scale;
+    const y = pageTopY + word.pdfRect.origin.y * scale;
+    const width = word.pdfRect.size.width * scale;
+    const height = word.pdfRect.size.height * scale;
 
-    const allSpans = Array.from(textLayer.querySelectorAll('span:not(.markedContent)'));
-    // Highlight the full range of spans (min to max index) so space
-    // spans between words are also highlighted — no striped gaps.
-    const minIdx = Math.min(...sentence.itemIndices);
-    const maxIdx = Math.max(...sentence.itemIndices);
-    const spans: HTMLElement[] = [];
-    for (let idx = minIdx; idx <= maxIdx; idx++) {
-      if (idx < allSpans.length) {
-        spans.push(allSpans[idx] as HTMLElement);
-      }
-    }
-
-    activeSentenceSpans = spans;
+    highlightRects = [{ x, y, width, height }];
   }
 
   // --- Controls handlers ---
+  let pausedAtSentence = -1;
+
   function handlePlayClick() {
     if (isPlaying && !isPaused) {
-      // Pause
       isPaused = true;
+      pausedAtSentence = currentSentenceIndex;
       audioPipeline.pause();
     } else if (isPaused) {
-      // Resume
       isPaused = false;
-      audioPipeline.resume();
+      if (currentSentenceIndex !== pausedAtSentence) {
+        startPlaybackFrom(currentSentenceIndex);
+      } else {
+        audioPipeline.resume();
+      }
     } else {
-      // Start
       startPlaybackFrom(currentSentenceIndex);
     }
   }
@@ -260,13 +534,10 @@
 
   function handleVoiceChange(newVoice: string) {
     voice = newVoice;
-    // Clear prefetch buffer so upcoming sentences regenerate with the new voice.
-    // The currently-playing sentence finishes with old voice; next one uses new.
-    audioBuffer = [];
+    ttsCache.clear();
   }
 
   function handleSentenceClick(event: { text: string; pageIndex: number }) {
-    // Find the sentence closest to the selected text
     const selectedText = event.text.trim();
     if (!selectedText) return;
     const selectedLower = selectedText.toLowerCase();
@@ -279,7 +550,6 @@
       if (s.pageIndex !== event.pageIndex) continue;
       const sentLower = s.text.toLowerCase();
 
-      // Check overlap: selection start found in sentence, or sentence start in selection
       let score = 0;
       const probe = selectedLower.substring(0, Math.min(20, selectedLower.length));
       if (sentLower.includes(probe)) {
@@ -298,31 +568,58 @@
 
     if (bestIndex >= 0) {
       currentSentenceIndex = bestIndex;
-      updateHighlight(bestIndex);
-      // If already playing, jump to the selected sentence
+      const sentence = sentences[bestIndex];
+      if (sentence.words.length > 0) {
+        updateHighlightForWord(sentence.words[0]);
+      }
       if (isPlaying && !isPaused) {
         startPlaybackFrom(bestIndex);
       }
-      // Otherwise just set position — user presses Play to start
     }
+  }
+
+  // --- Registry ready handler ---
+  function handleRegistryReady(reg: PluginRegistry) {
+    registry = reg;
+    engine = reg.getEngine();
+
+    // Listen for document loads
+    const store = reg.getStore();
+    store.onAction('SET_DOCUMENT_LOADED', (action: any, state: any) => {
+      // The action payload contains the document directly
+      const docId = action.payload?.documentId ?? action.documentId;
+      const doc = action.payload?.document;
+      
+      if (doc && engine) {
+        pdfDoc = doc;
+        extractTextFromDoc(engine, doc);
+      } else {
+        // Fallback: get document from state
+        const activeId = state.core.activeDocumentId;
+        if (activeId && engine) {
+          const docState = state.core.documents[activeId];
+          if (docState?.document) {
+            pdfDoc = docState.document;
+            extractTextFromDoc(engine, docState.document);
+          }
+        }
+      }
+    });
   }
 
   // --- PDF loading ---
   let isDragOver = $state(false);
 
-  async function loadPdfFile(file: File) {
-    const buffer = await file.arrayBuffer();
-    const doc = await pdfjsLib.getDocument({ data: buffer }).promise;
-    pdf = doc;
-    sentences = await extractSentences(doc);
-    currentSentenceIndex = 0;
+  function loadPdfFile(file: File) {
+    // Revoke previous blob URL if any
+    if (pdfSrc && pdfSrc.startsWith('blob:')) {
+      URL.revokeObjectURL(pdfSrc);
+    }
+    pdfSrc = URL.createObjectURL(file);
   }
 
-  async function loadPdfFromUrl(url: string) {
-    const doc = await pdfjsLib.getDocument(url).promise;
-    pdf = doc;
-    sentences = await extractSentences(doc);
-    currentSentenceIndex = 0;
+  function loadPdfFromUrl(url: string) {
+    pdfSrc = url;
   }
 
   // Auto-load PDF from ?file= URL parameter
@@ -362,27 +659,7 @@
 
   // --- Keyboard shortcuts ---
   function handleKeydown(e: KeyboardEvent) {
-    // Don't capture when typing in inputs
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
-
-    // Zoom shortcuts (Ctrl/Cmd + plus/minus/zero)
-    if (e.ctrlKey || e.metaKey) {
-      if (e.key === '=' || e.key === '+') {
-        e.preventDefault();
-        pdfViewer?.zoomIn();
-        return;
-      }
-      if (e.key === '-') {
-        e.preventDefault();
-        pdfViewer?.zoomOut();
-        return;
-      }
-      if (e.key === '0') {
-        e.preventDefault();
-        pdfViewer?.zoomFitWidth();
-        return;
-      }
-    }
 
     switch (e.code) {
       case 'Space':
@@ -417,7 +694,7 @@
         audioPipeline.stop();
         isPlaying = false;
         isPaused = false;
-        activeSentenceSpans = [];
+        clearHighlight();
         break;
     }
   }
@@ -425,7 +702,7 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
-{#if !pdf}
+{#if !pdfSrc}
   <!-- Drop zone / file picker -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
@@ -450,8 +727,8 @@
     </div>
   </div>
 {:else}
-  <PdfViewer {pdf} onsentenceclick={handleSentenceClick} bind:this={pdfViewer} />
-  <Highlight {activeSentenceSpans} />
+  <PdfViewer src={pdfSrc} onsentenceclick={handleSentenceClick} onregistryready={handleRegistryReady} />
+  <Highlight rects={highlightRects} {registry} />
   <Controls
     isPlaying={isPlaying && !isPaused}
     {speed}

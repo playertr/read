@@ -3,7 +3,9 @@ import {
   filterNonBodyItems,
   splitSentences,
   isParagraphBreak,
+  buildSpanCharRanges,
   type ItemEntry,
+  type CharInfo,
 } from '../../src/lib/pdf-text';
 
 // Helper to create TextItems matching pdfjs-dist shape
@@ -180,6 +182,109 @@ describe('pdf-text: splitSentences', () => {
     expect(result).toHaveLength(1);
     expect(result[0].itemIndices).toContain(0);
     expect(result[0].itemIndices).toContain(1);
+  });
+
+  it('computes spanCharRanges when charInfoList is provided', () => {
+    // Simulate a single span containing two sentences:
+    // "First sentence here. Second sentence here."
+    // All chars belong to span index 5.
+    const text = 'First sentence here. Second sentence here.';
+    const mapping = Array.from({ length: text.length }, () => [5]);
+    const charInfoList = Array.from({ length: text.length }, (_, i) => ({
+      spanIndex: 5,
+      charInSpan: i,
+    }));
+    const result = splitSentences(text, mapping, 0, charInfoList);
+    // Both sentences are short, so they merge into one
+    expect(result).toHaveLength(1);
+    expect(result[0].spanCharRanges).toBeDefined();
+    expect(result[0].spanCharRanges![0].spanIndex).toBe(5);
+    expect(result[0].spanCharRanges![0].startChar).toBe(0);
+    expect(result[0].spanCharRanges![0].endChar).toBe(text.length);
+  });
+
+  it('splits spanCharRanges across shared boundary spans', () => {
+    // Two long sentences sharing a span at the boundary:
+    // Span 0 (chars 0-59): "First long sentence that is definitely long enough to split."
+    // Span 1 (chars 60-119): " Second long sentence that continues in a separate span here."
+    const s1 = 'First long sentence that is definitely long enough to split.';
+    const s2 = ' Second long sentence that continues in a separate span here.';
+    const text = s1 + s2;
+    const mapping = [
+      ...Array.from({ length: s1.length }, () => [0]),
+      ...Array.from({ length: s2.length }, () => [1]),
+    ];
+    const charInfoList = [
+      ...Array.from({ length: s1.length }, (_, i) => ({ spanIndex: 0, charInSpan: i })),
+      ...Array.from({ length: s2.length }, (_, i) => ({ spanIndex: 1, charInSpan: i })),
+    ];
+    const result = splitSentences(text, mapping, 0, charInfoList);
+    expect(result).toHaveLength(2);
+
+    // First sentence uses only span 0
+    expect(result[0].spanCharRanges).toBeDefined();
+    expect(result[0].spanCharRanges!).toHaveLength(1);
+    expect(result[0].spanCharRanges![0].spanIndex).toBe(0);
+    expect(result[0].spanCharRanges![0].startChar).toBe(0);
+    expect(result[0].spanCharRanges![0].endChar).toBe(s1.length);
+
+    // Second sentence uses only span 1
+    expect(result[1].spanCharRanges).toBeDefined();
+    expect(result[1].spanCharRanges!).toHaveLength(1);
+    expect(result[1].spanCharRanges![0].spanIndex).toBe(1);
+  });
+
+  it('handles shared span between two sentences with correct char ranges', () => {
+    // Single span contains BOTH sentences — both long enough to avoid merging
+    const s1 = 'This module handles all of the data manipulation and transformation steps.';
+    const s2 = ' Through a carefully designed evaluation pipeline the system achieves robust results.';
+    const text = s1 + s2;
+    const mapping = Array.from({ length: text.length }, () => [6]);
+    const charInfoList = Array.from({ length: text.length }, (_, i) => ({
+      spanIndex: 6,
+      charInSpan: i,
+    }));
+    const result = splitSentences(text, mapping, 0, charInfoList);
+    expect(result).toHaveLength(2);
+
+    // First sentence ends before the second starts
+    const r1 = result[0].spanCharRanges!;
+    expect(r1).toHaveLength(1);
+    expect(r1[0].spanIndex).toBe(6);
+    expect(r1[0].startChar).toBe(0);
+    expect(r1[0].endChar).toBeLessThan(text.length);
+
+    // Second sentence starts after the first ends
+    const r2 = result[1].spanCharRanges!;
+    expect(r2).toHaveLength(1);
+    expect(r2[0].spanIndex).toBe(6);
+    expect(r2[0].startChar).toBeGreaterThan(0);
+    expect(r2[0].endChar).toBe(text.length);
+
+    // No overlap: first's end <= second's start
+    expect(r1[0].endChar).toBeLessThanOrEqual(r2[0].startChar);
+  });
+
+  it('skips synthetic chars (-1) in spanCharRanges', () => {
+    // Span 0: str="Hello" + added trailing space (synthetic)
+    // Span 1: str="world here and more text to avoid merging into a short sentence."
+    const text = 'Hello world here and more text to avoid merging into a short sentence.';
+    const mapping = [
+      ...Array.from({ length: 6 }, () => [0]),  // "Hello " (5 real + 1 synthetic)
+      ...Array.from({ length: 64 }, () => [1]),  // rest
+    ];
+    const charInfoList = [
+      ...Array.from({ length: 5 }, (_, i) => ({ spanIndex: 0, charInSpan: i })),
+      { spanIndex: 0, charInSpan: -1 }, // synthetic space
+      ...Array.from({ length: 64 }, (_, i) => ({ spanIndex: 1, charInSpan: i })),
+    ];
+    const result = splitSentences(text, mapping, 0, charInfoList);
+    expect(result).toHaveLength(1);
+    // Span 0's range should cover chars 0-5 (not 0-6, since char 5 is synthetic)
+    const span0Range = result[0].spanCharRanges!.find(r => r.spanIndex === 0);
+    expect(span0Range).toBeDefined();
+    expect(span0Range!.startChar).toBe(0);
+    expect(span0Range!.endChar).toBe(5); // NOT 6
   });
 });
 
@@ -542,6 +647,149 @@ describe('Font-relative thresholds', () => {
       // The text should read "Hello" not "Hel lo"
       // Stream order is already correct
       expect(items.length).toBe(2);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Word extraction
+  // -----------------------------------------------------------------------
+  describe('word extraction', () => {
+    it('produces words with correct text from a simple sentence', () => {
+      const charInfoList: CharInfo[] = [];
+      // Span 0: "Hello " (5 real chars + 1 synthetic space)
+      for (let i = 0; i < 5; i++) charInfoList.push({ spanIndex: 0, charInSpan: i });
+      charInfoList.push({ spanIndex: 0, charInSpan: -1 }); // synthetic space
+      // Span 1: "world." (6 real chars)
+      for (let i = 0; i < 6; i++) charInfoList.push({ spanIndex: 1, charInSpan: i });
+
+      const fullText = 'Hello world.';
+      const charToItemIndices = fullText.split('').map((_, i) => [i < 6 ? 0 : 1]);
+
+      const sentences = splitSentences(fullText, charToItemIndices, 0, charInfoList);
+      expect(sentences.length).toBe(1);
+      expect(sentences[0].words).toBeDefined();
+      const words = sentences[0].words!;
+      expect(words.map((w) => w.text)).toEqual(['Hello', 'world.']);
+    });
+
+    it('produces correct spanCharRanges per word', () => {
+      const charInfoList: CharInfo[] = [];
+      // Span 0: "Hello " (5 real + 1 synthetic)
+      for (let i = 0; i < 5; i++) charInfoList.push({ spanIndex: 0, charInSpan: i });
+      charInfoList.push({ spanIndex: 0, charInSpan: -1 });
+      // Span 1: "world." (6 real)
+      for (let i = 0; i < 6; i++) charInfoList.push({ spanIndex: 1, charInSpan: i });
+
+      const fullText = 'Hello world.';
+      const charToItemIndices = fullText.split('').map((_, i) => [i < 6 ? 0 : 1]);
+
+      const sentences = splitSentences(fullText, charToItemIndices, 0, charInfoList);
+      const words = sentences[0].words!;
+
+      // "Hello" → span 0, chars 0-5
+      expect(words[0].spanCharRanges).toEqual([{ spanIndex: 0, startChar: 0, endChar: 5 }]);
+      // "world." → span 1, chars 0-6
+      expect(words[1].spanCharRanges).toEqual([{ spanIndex: 1, startChar: 0, endChar: 6 }]);
+    });
+
+    it('handles a word spanning two DOM spans', () => {
+      const charInfoList: CharInfo[] = [];
+      // Span 0: "hel" (3 real, from a hyphenated line break: "hel-\nlo" → "hello")
+      for (let i = 0; i < 3; i++) charInfoList.push({ spanIndex: 0, charInSpan: i });
+      // Span 1: "lo " (2 real + 1 synthetic space)
+      for (let i = 0; i < 2; i++) charInfoList.push({ spanIndex: 1, charInSpan: i });
+      charInfoList.push({ spanIndex: 1, charInSpan: -1 });
+      // Span 2: "world." (6 real)
+      for (let i = 0; i < 6; i++) charInfoList.push({ spanIndex: 2, charInSpan: i });
+
+      const fullText = 'hello world.';
+      const charToItemIndices = fullText.split('').map(() => [0]);
+
+      const sentences = splitSentences(fullText, charToItemIndices, 0, charInfoList);
+      const words = sentences[0].words!;
+
+      expect(words[0].text).toBe('hello');
+      // "hello" spans DOM span 0 (chars 0-3) and span 1 (chars 0-2)
+      expect(words[0].spanCharRanges).toEqual([
+        { spanIndex: 0, startChar: 0, endChar: 3 },
+        { spanIndex: 1, startChar: 0, endChar: 2 },
+      ]);
+    });
+
+    it('handles multiple sentences with words', () => {
+      const charInfoList: CharInfo[] = [];
+      // "Hello world. Goodbye moon." — all in one span (26 real chars)
+      const fullText = 'Hello world. Goodbye moon.';
+      for (let i = 0; i < fullText.length; i++) {
+        charInfoList.push({ spanIndex: 0, charInSpan: i });
+      }
+      const charToItemIndices = fullText.split('').map(() => [0]);
+
+      const sentences = splitSentences(fullText, charToItemIndices, 0, charInfoList);
+      // Two sentences (both may be merged if short, but let's check words regardless)
+      for (const s of sentences) {
+        expect(s.words).toBeDefined();
+        expect(s.words!.length).toBeGreaterThan(0);
+        // Every word should have non-empty spanCharRanges
+        for (const w of s.words!) {
+          expect(w.spanCharRanges.length).toBeGreaterThan(0);
+        }
+      }
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // buildSpanCharRanges utility
+  // -----------------------------------------------------------------------
+  describe('buildSpanCharRanges', () => {
+    it('builds ranges for a contiguous slice', () => {
+      const charInfoList: CharInfo[] = [
+        { spanIndex: 0, charInSpan: 0 },
+        { spanIndex: 0, charInSpan: 1 },
+        { spanIndex: 0, charInSpan: 2 },
+        { spanIndex: 1, charInSpan: 0 },
+        { spanIndex: 1, charInSpan: 1 },
+      ];
+      const result = buildSpanCharRanges(charInfoList, 0, 5);
+      expect(result).toEqual([
+        { spanIndex: 0, startChar: 0, endChar: 3 },
+        { spanIndex: 1, startChar: 0, endChar: 2 },
+      ]);
+    });
+
+    it('skips synthetic characters (charInSpan = -1)', () => {
+      const charInfoList: CharInfo[] = [
+        { spanIndex: 0, charInSpan: 0 },
+        { spanIndex: 0, charInSpan: 1 },
+        { spanIndex: 0, charInSpan: -1 }, // synthetic space
+        { spanIndex: 1, charInSpan: 0 },
+      ];
+      const result = buildSpanCharRanges(charInfoList, 0, 4);
+      expect(result).toEqual([
+        { spanIndex: 0, startChar: 0, endChar: 2 },
+        { spanIndex: 1, startChar: 0, endChar: 1 },
+      ]);
+    });
+
+    it('handles a sub-slice (word within sentence)', () => {
+      const charInfoList: CharInfo[] = [
+        { spanIndex: 0, charInSpan: 0 }, // H
+        { spanIndex: 0, charInSpan: 1 }, // e
+        { spanIndex: 0, charInSpan: 2 }, // l
+        { spanIndex: 0, charInSpan: 3 }, // l
+        { spanIndex: 0, charInSpan: 4 }, // o
+        { spanIndex: 0, charInSpan: -1 }, // space (synthetic)
+        { spanIndex: 1, charInSpan: 0 }, // w
+        { spanIndex: 1, charInSpan: 1 }, // o
+        { spanIndex: 1, charInSpan: 2 }, // r
+        { spanIndex: 1, charInSpan: 3 }, // l
+        { spanIndex: 1, charInSpan: 4 }, // d
+      ];
+      // Slice for "world" (indices 6-11)
+      const result = buildSpanCharRanges(charInfoList, 6, 11);
+      expect(result).toEqual([
+        { spanIndex: 1, startChar: 0, endChar: 5 },
+      ]);
     });
   });
 });

@@ -29,11 +29,34 @@ export interface TextItem {
   hasEOL: boolean;
 }
 
+/** Character range within a single DOM span for sub-span highlighting. */
+export interface SpanCharRange {
+  spanIndex: number;   // DOM span index in the page's textLayer
+  startChar: number;   // Inclusive start offset in span's textContent
+  endChar: number;     // Exclusive end offset in span's textContent
+}
+
+/** A single word within a sentence, with its own sub-span highlight ranges. */
+export interface Word {
+  text: string;
+  spanCharRanges: SpanCharRange[];
+}
+
 export interface Sentence {
   text: string;
   pageIndex: number;
   /** Indices into the page's TextItem array, for highlight positioning. */
   itemIndices: number[];
+  /** Precise character ranges per span (for sub-span highlighting). */
+  spanCharRanges?: SpanCharRange[];
+  /** Individual words with their own spanCharRanges for word-level highlighting. */
+  words?: Word[];
+}
+
+/** Maps an extracted character to its position within a DOM span. */
+export interface CharInfo {
+  spanIndex: number;
+  charInSpan: number; // -1 for synthetic chars (added spaces)
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +130,36 @@ const ABBREVIATIONS = new Set([
 ]);
 
 /**
+ * Build SpanCharRange[] for a slice of the charInfoList.
+ * Groups consecutive characters by their DOM span index.
+ */
+export function buildSpanCharRanges(
+  charInfoList: CharInfo[],
+  start: number,
+  end: number,
+): SpanCharRange[] {
+  const rangeMap = new Map<number, { start: number; end: number }>();
+  for (let ci = start; ci < end && ci < charInfoList.length; ci++) {
+    const info = charInfoList[ci];
+    if (info.charInSpan < 0) continue;
+    const existing = rangeMap.get(info.spanIndex);
+    if (existing) {
+      existing.start = Math.min(existing.start, info.charInSpan);
+      existing.end = Math.max(existing.end, info.charInSpan + 1);
+    } else {
+      rangeMap.set(info.spanIndex, { start: info.charInSpan, end: info.charInSpan + 1 });
+    }
+  }
+  return [...rangeMap.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([spanIndex, range]) => ({
+      spanIndex,
+      startChar: range.start,
+      endChar: range.end,
+    }));
+}
+
+/**
  * Split text into sentences with awareness of abbreviations and minimum
  * length. Short fragments are merged with their neighbors.
  */
@@ -114,6 +167,7 @@ export function splitSentences(
   fullText: string,
   charToItemIndices: number[][],
   pageIndex: number,
+  charInfoList?: CharInfo[],
 ): Sentence[] {
   const raw: { text: string; start: number; end: number }[] = [];
 
@@ -211,10 +265,33 @@ export function splitSentences(
         indexSet.add(idx);
       }
     }
+
+    // Compute sub-span character ranges when charInfoList is available
+    const spanCharRanges = charInfoList
+      ? buildSpanCharRanges(charInfoList, s.start, s.end)
+      : undefined;
+
+    // Compute word-level data for word-by-word highlighting
+    let words: Word[] | undefined;
+    if (charInfoList) {
+      const slice = fullText.slice(s.start, s.end);
+      const matches = [...slice.matchAll(/\S+/g)];
+      words = matches.map((m) => ({
+        text: m[0],
+        spanCharRanges: buildSpanCharRanges(
+          charInfoList,
+          s.start + m.index!,
+          s.start + m.index! + m[0].length,
+        ),
+      }));
+    }
+
     return {
       text: s.text,
       pageIndex,
       itemIndices: [...indexSet].sort((a, b) => a - b),
+      ...(spanCharRanges ? { spanCharRanges } : {}),
+      ...(words ? { words } : {}),
     };
   });
 }
@@ -283,12 +360,19 @@ export async function extractSentences(
     const content = await page.getTextContent();
     const viewport = page.getViewport({ scale: 1 });
 
-    // Filter to real TextItems (skip TextMarkedContent) with non-empty str
+    // Filter to real TextItems (skip TextMarkedContent) with non-empty str.
+    // Track textDivIndex: pdf.js TextLayer creates one <span> per item with
+    // a non-empty `str` (items with str==="" are skipped by the renderer).
+    // We need this index to map sentences back to DOM spans for highlighting.
     const items: ItemEntry[] = [];
+    let textDivIndex = 0;
     for (let i = 0; i < content.items.length; i++) {
       const raw = content.items[i];
-      if ("str" in raw && (raw as TextItem).str.trim().length > 0) {
-        items.push({ item: raw as TextItem, index: i });
+      if ("str" in raw && (raw as TextItem).str !== "") {
+        if ((raw as TextItem).str.trim().length > 0) {
+          items.push({ item: raw as TextItem, index: textDivIndex });
+        }
+        textDivIndex++;
       }
     }
 
@@ -308,6 +392,7 @@ export async function extractSentences(
     interface Span {
       text: string;
       itemIndices: number[];
+      origStrLen: number; // Length of original TextItem.str
     }
 
     const paragraphs: Span[][] = [[]];
@@ -337,9 +422,9 @@ export async function extractSentences(
 
       let span: Span;
       if (endsWithHyphen && isLineBreak && nextEntry) {
-        span = { text: str.slice(0, -1), itemIndices: [entry.index] };
+        span = { text: str.slice(0, -1), itemIndices: [entry.index], origStrLen: str.length };
       } else if (isLineBreak) {
-        span = { text: str + " ", itemIndices: [entry.index] };
+        span = { text: str + " ", itemIndices: [entry.index], origStrLen: str.length };
       } else {
         // Same-line items: detect horizontal gaps (missing spaces from
         // filtered-out space-only TextItems)
@@ -354,6 +439,7 @@ export async function extractSentences(
         span = {
           text: str + (needsSpace ? " " : ""),
           itemIndices: [entry.index],
+          origStrLen: str.length,
         };
       }
 
@@ -364,11 +450,17 @@ export async function extractSentences(
     for (const paraSpans of paragraphs) {
       let fullText = "";
       const charToItemIndices: number[][] = [];
+      const charInfoList: CharInfo[] = [];
 
       for (const span of paraSpans) {
-        for (const ch of span.text) {
-          fullText += ch;
+        const spanIdx = span.itemIndices[0];
+        for (let i = 0; i < span.text.length; i++) {
+          fullText += span.text[i];
           charToItemIndices.push(span.itemIndices);
+          charInfoList.push({
+            spanIndex: spanIdx,
+            charInSpan: i < span.origStrLen ? i : -1,
+          });
         }
       }
 
@@ -378,6 +470,7 @@ export async function extractSentences(
         fullText,
         charToItemIndices,
         pageIndex,
+        charInfoList,
       );
       sentences.push(...pageSentences);
     }

@@ -1,79 +1,61 @@
 <script lang="ts">
-  interface Props {
-    activeSentenceSpans: HTMLElement[];
+  import type { PluginRegistry } from '@embedpdf/svelte-pdf-viewer';
+
+  interface HighlightRect {
+    /** Absolute X within the document container (CSS pixels). */
+    x: number;
+    /** Absolute Y within the document container (CSS pixels). */
+    y: number;
+    width: number;
+    height: number;
   }
 
-  let { activeSentenceSpans }: Props = $props();
+  interface Props {
+    /** Highlight rectangles in absolute document-container coords (CSS px). */
+    rects: HighlightRect[];
+    /** The EmbedPDF registry (used to locate the shadow DOM). */
+    registry: PluginRegistry | null;
+  }
+
+  let { rects, registry }: Props = $props();
 
   let overlays: HTMLElement[] = [];
+  let highlightLayer: HTMLElement | null = null;
 
-  /**
-   * Build continuous highlight rectangles by grouping spans into lines
-   * and creating a single overlay per line. This avoids the gaps between
-   * pdf.js's absolutely-positioned text spans.
-   */
-  function buildOverlays(spans: HTMLElement[]): HTMLElement[] {
-    if (spans.length === 0) return [];
+  /** Find (or create) the highlight layer inside the EmbedPDF shadow DOM's
+   *  document container — the div with position:relative that spans all pages. */
+  function getHighlightLayer(): HTMLElement | null {
+    if (highlightLayer?.isConnected) return highlightLayer;
+    highlightLayer = null;
 
-    const textLayer = spans[0].closest('.textLayer') as HTMLElement | null;
-    if (!textLayer) return [];
+    const container = document.querySelector('embedpdf-container');
+    const sr = container?.shadowRoot;
+    if (!sr) return null;
 
-    const tlRect = textLayer.getBoundingClientRect();
+    // The scroll container is .bg-bg-app
+    const scrollEl = sr.querySelector('.bg-bg-app');
+    if (!scrollEl) return null;
 
-    // Group spans into lines by Y position
-    type Line = { left: number; right: number; top: number; bottom: number };
-    const lines: Line[] = [];
+    // Navigate: scrollEl → inline-block wrapper → document container (position: relative)
+    const wrapper = scrollEl.firstElementChild as HTMLElement | null;
+    const docContainer = wrapper?.firstElementChild as HTMLElement | null;
+    if (!docContainer || !docContainer.style.position?.includes('relative')) return null;
 
-    for (const span of spans) {
-      const r = span.getBoundingClientRect();
-      if (r.width === 0 && r.height === 0) continue;
-
-      const relLeft = r.left - tlRect.left;
-      const relTop = r.top - tlRect.top;
-      const relRight = relLeft + r.width;
-      const relBottom = relTop + r.height;
-
-      // Find existing line within vertical tolerance
-      let merged = false;
-      for (const line of lines) {
-        const overlapY = Math.min(relBottom, line.bottom) - Math.max(relTop, line.top);
-        const minH = Math.min(r.height, line.bottom - line.top);
-        if (minH > 0 && overlapY / minH > 0.5) {
-          line.left = Math.min(line.left, relLeft);
-          line.right = Math.max(line.right, relRight);
-          line.top = Math.min(line.top, relTop);
-          line.bottom = Math.max(line.bottom, relBottom);
-          merged = true;
-          break;
-        }
-      }
-      if (!merged) {
-        lines.push({ left: relLeft, right: relRight, top: relTop, bottom: relBottom });
-      }
-    }
-
-    // Convert from viewport-relative to textLayer-local coordinates.
-    // If textLayer has a CSS scale transform we need to compensate.
-    const scaleX = tlRect.width > 0 ? textLayer.offsetWidth / tlRect.width : 1;
-    const scaleY = tlRect.height > 0 ? textLayer.offsetHeight / tlRect.height : 1;
-
-    const result: HTMLElement[] = [];
-    for (const line of lines) {
-      const div = document.createElement('div');
-      div.className = 'reading-highlight-overlay';
-      div.style.cssText = `
+    // Look for existing highlight layer
+    let layer = docContainer.querySelector('.tts-highlight-layer') as HTMLElement | null;
+    if (!layer) {
+      layer = document.createElement('div');
+      layer.className = 'tts-highlight-layer';
+      layer.style.cssText = `
         position: absolute;
-        left: ${line.left * scaleX}px;
-        top: ${line.top * scaleY}px;
-        width: ${(line.right - line.left) * scaleX}px;
-        height: ${(line.bottom - line.top) * scaleY}px;
+        inset: 0;
         pointer-events: none;
-        z-index: 0;
+        z-index: 20;
       `;
-      textLayer.appendChild(div);
-      result.push(div);
+      docContainer.appendChild(layer);
     }
-    return result;
+    highlightLayer = layer;
+    return layer;
   }
 
   $effect(() => {
@@ -81,15 +63,32 @@
     for (const o of overlays) o.remove();
     overlays = [];
 
-    if (activeSentenceSpans.length === 0) return;
+    if (rects.length === 0 || !registry) return;
 
-    overlays = buildOverlays(activeSentenceSpans);
+    const layer = getHighlightLayer();
+    if (!layer) return;
 
-    // Smooth-scroll the first active span into view
-    activeSentenceSpans[0].scrollIntoView({
-      behavior: 'smooth',
-      block: 'center',
-    });
+    for (const rect of rects) {
+      const div = document.createElement('div');
+      div.className = 'reading-highlight-overlay';
+      div.style.cssText = `
+        position: absolute;
+        left: ${rect.x}px;
+        top: ${rect.y}px;
+        width: ${rect.width}px;
+        height: ${rect.height}px;
+        background: rgba(66, 133, 244, 0.35);
+        border-radius: 2px;
+        pointer-events: none;
+      `;
+      layer.appendChild(div);
+      overlays.push(div);
+    }
+
+    // Scroll the first highlight into view within the shadow DOM scroll container
+    if (overlays.length > 0) {
+      overlays[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
 
     return () => {
       for (const o of overlays) o.remove();

@@ -10,7 +10,7 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    exclude: ['kokoro-js', 'onnxruntime-web'],
+    exclude: ['kokoro-js', 'onnxruntime-web', '@embedpdf/snippet'],
   },
   worker: {
     format: 'es',
